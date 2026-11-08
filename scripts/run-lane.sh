@@ -62,7 +62,8 @@ echo "::group::5) start bore raw-TCP relay"
 BORE_PID=$!
 PUBLIC_PORT=""
 for i in $(seq 1 30); do
-  PUBLIC_PORT=$(grep -oE 'remote_port=[0-9]+' "$BOX/bore.log" 2>/dev/null | head -1 | cut -d= -f2 || true)
+  # bore logs with ANSI color codes, so strip them before extracting the port.
+  PUBLIC_PORT=$(sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$BOX/bore.log" 2>/dev/null | grep -oE 'remote_port=[0-9]+' | head -1 | cut -d= -f2 || true)
   [ -n "$PUBLIC_PORT" ] && break
   sleep 1
 done
