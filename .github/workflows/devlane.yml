@@ -1,0 +1,41 @@
+name: devlane
+
+# Single-box dev/test lane: boots a temporary Minecraft server and exposes it
+# over a raw TCP relay so we can validate the Glasslane control-plane idea.
+# Hard 5-hour cap, one box at a time, nothing persisted.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to keep the box up (max 290)"
+        required: false
+        default: "8"
+        type: string
+
+permissions:
+  contents: read
+
+# One lane at a time, account-wide. A new run cancels the old one.
+concurrency:
+  group: glasslane-devlane
+  cancel-in-progress: true
+
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Boot lane
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: bash scripts/run-lane.sh "${DURATION_MINUTES:-8}"
