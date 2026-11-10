@@ -1,12 +1,21 @@
 name: devlane
+run-name: "shard-${{ inputs.owner }}-${{ inputs.name }}"
 
 # Single-box dev/test lane: boots a temporary Minecraft server and exposes it
 # over a raw TCP relay so we can validate the Glasslane control-plane idea.
-# Hard 5-hour cap, one box at a time, nothing persisted.
+# Hard 5-hour cap, one box at a time per owner, nothing persisted.
 
 on:
   workflow_dispatch:
     inputs:
+      owner:
+        description: "Shards owner (Discord user id)"
+        required: true
+        type: string
+      name:
+        description: "Shard name (lowercase letters, numbers, dashes)"
+        required: true
+        type: string
       duration_minutes:
         description: "How long to keep the box up (max 290)"
         required: false
@@ -16,9 +25,9 @@ on:
 permissions:
   contents: read
 
-# One lane at a time, account-wide. A new run cancels the old one.
+# One lane at a time per owner. A new run cancels the owner's old one.
 concurrency:
-  group: glasslane-devlane
+  group: glasslane-shard-${{ inputs.owner }}
   cancel-in-progress: true
 
 jobs:
@@ -38,4 +47,5 @@ jobs:
       - name: Boot lane
         env:
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
-        run: bash scripts/run-lane.sh "${DURATION_MINUTES:-8}"
+          SHARD_NAME: ${{ inputs.name }}
+        run: bash scripts/run-lane.sh "${DURATION_MINUTES:-8}" "${SHARD_NAME:-shard}"
