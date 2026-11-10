@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Shards Runner Agent — manages the Minecraft server process, network tunnel,
-live console stream, resource telemetry, and file manager.
+"""Shards Runner Agent — PTY ANSI color console, locked MOTD & BossBar branding,
+safe version switcher, plugin installer, and sub-second state sync.
 """
 import base64
 import glob
 import json
 import os
+import pty
 import re
+import select
 import shutil
 import signal
 import socket
-import struct
 import subprocess
 import threading
 import time
@@ -23,6 +24,10 @@ DURATION_MIN = min(290, max(1, int(os.environ.get("DURATION_MINUTES") or "290"))
 SHARD_OWNER = (os.environ.get("SHARD_OWNER") or "").strip()
 SHARD_NAME = re.sub(r"[^a-z0-9-]", "", (os.environ.get("SHARD_NAME") or "shard").lower())[:24] or "shard"
 SHARD_ID = (os.environ.get("SHARD_ID") or "").strip()
+SHARD_SOFTWARE = (os.environ.get("SHARD_SOFTWARE") or "paper").strip().lower()
+SHARD_VERSION = (os.environ.get("SHARD_VERSION") or "1.21.10").strip()
+SHARD_BUILD = (os.environ.get("SHARD_BUILD") or "latest").strip()
+SHARD_JAR_URL = (os.environ.get("SHARD_JAR_URL") or "").strip()
 API_BASE = (os.environ.get("SHARDS_API_URL") or "https://shards.zealot.bond").rstrip("/")
 RUN_ID = (os.environ.get("GITHUB_RUN_ID") or "").strip()
 
@@ -31,12 +36,29 @@ BOX_DIR = ROOT_DIR / ".devlane"
 SERVER_DIR = BOX_DIR / "server"
 BORE_BIN = BOX_DIR / "bore"
 
-JAR_URL = "https://fill-data.papermc.io/v1/objects/158703f75a26f842ea656b3dc6d75bf3d1ec176b97a2c36384d0b80b3871af53/paper-1.21.10-130.jar"
+DEFAULT_JAR_URL = "https://fill-data.papermc.io/v1/objects/158703f75a26f842ea656b3dc6d75bf3d1ec176b97a2c36384d0b80b3871af53/paper-1.21.10-130.jar"
 BORE_URL = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+LOCKED_MOTD = r"\u00a7bHosted on shards.zealot.bond"
+LOCKED_BOSSBAR_JSON = '{"text":"Hosted on shards.zealot.bond","color":"aqua","bold":true}'
+
+# Keep SGR color codes (\x1b[...m), strip non-color terminal control sequences
+CTRL_ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[A-LN-Z\\^_`a-ln-z{|}~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][A-Za-z0-9]|[=>])")
+PLAIN_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+ISO_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+")
 BORE_SCRUB_RE = re.compile(r"bore\.pub(:\d+)?", re.IGNORECASE)
 DONE_RE = re.compile(r'Done \([0-9.]+s\)! For help, type "help"')
+JOIN_RE = re.compile(r":\s+([A-Za-z0-9_.]{2,16})\[/.*?\] logged in with entity id")
+LEAVE_RE = re.compile(r":\s+([A-Za-z0-9_]{2,16}) left the game")
+
+SHARDS_ASCII = [
+    "\x1b[38;2;99;182;250m\x1b[1m  ____  _                   _     \x1b[0m",
+    "\x1b[38;2;99;182;250m\x1b[1m / ___|| |__   __ _ _ __ __| |___ \x1b[0m",
+    "\x1b[38;2;99;182;250m\x1b[1m \\___ \\| '_ \\ / _` | '__/ _` / __|\x1b[0m",
+    "\x1b[38;2;99;182;250m\x1b[1m  ___) | | | | (_| | | | (_| \\__ \\\x1b[0m",
+    "\x1b[38;2;99;182;250m\x1b[1m |____/|_| |_|\\__,_|_|  \\__,_|___/\x1b[0m",
+    "\x1b[38;2;147;197;253m  Hosted on shards.zealot.bond\x1b[0m",
+]
 
 
 def find_java_bin():
@@ -49,20 +71,91 @@ def find_java_bin():
     return shutil.which("java") or "java"
 
 
+def resolve_software_jar_url(software, version, build="latest", explicit_url=""):
+    if explicit_url and explicit_url.startswith("https://"):
+        return explicit_url, software, version, build
+    sw = (software or "paper").lower()
+    ver = (version or "1.21.10").strip()
+    headers = {"User-Agent": "Shards/1.0 (https://shards.zealot.bond)"}
+
+    def get_json(url):
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+
+    try:
+        if sw in ("paper", "folia", "velocity"):
+            proj = sw
+            d = get_json(f"https://api.papermc.io/v2/projects/{proj}/versions/{ver}/builds")
+            builds = d.get("builds") or []
+            if builds:
+                b = builds[-1] if build in ("", "latest") else next((x for x in builds if str(x.get("build")) == str(build)), builds[-1])
+                bnum = b.get("build")
+                fname = ((b.get("downloads") or {}).get("application") or {}).get("name") or f"{proj}-{ver}-{bnum}.jar"
+                return f"https://api.papermc.io/v2/projects/{proj}/versions/{ver}/builds/{bnum}/downloads/{fname}", sw, ver, str(bnum)
+        elif sw == "purpur":
+            d = get_json(f"https://api.purpurmc.org/v2/purpur/{ver}")
+            builds = (d.get("builds") or {}).get("all") or []
+            bnum = d.get("builds", {}).get("latest") if build in ("", "latest") else build
+            if not bnum and builds:
+                bnum = builds[-1]
+            if bnum:
+                return f"https://api.purpurmc.org/v2/purpur/{ver}/{bnum}/download", sw, ver, str(bnum)
+        elif sw == "leaf":
+            d = get_json(f"https://api.leafmc.one/v2/projects/leaf/versions/{ver}/builds")
+            builds = d.get("builds") or []
+            if builds:
+                b = builds[-1] if build in ("", "latest") else next((x for x in builds if str(x.get("build")) == str(build)), builds[-1])
+                bnum = b.get("build")
+                fname = ((b.get("downloads") or {}).get("primary") or {}).get("name") or f"leaf-{ver}-{bnum}.jar"
+                return f"https://api.leafmc.one/v2/projects/leaf/versions/{ver}/builds/{bnum}/downloads/{fname}", sw, ver, str(bnum)
+        elif sw == "pufferfish":
+            major = "1.20" if ver.startswith("1.20") else ("1.19" if ver.startswith("1.19") else "1.21")
+            d = get_json(f"https://ci.pufferfish.host/job/Pufferfish-{major}/lastSuccessfulBuild/api/json")
+            arts = d.get("artifacts") or []
+            if arts:
+                rel = arts[0].get("relativePath")
+                bnum = d.get("number") or "latest"
+                return f"https://ci.pufferfish.host/job/Pufferfish-{major}/lastSuccessfulBuild/artifact/{rel}", sw, ver, str(bnum)
+        elif sw == "fabric":
+            return f"https://meta.fabricmc.net/v2/versions/loader/{ver}/0.16.9/1.0.1/server/jar", sw, ver, "0.16.9"
+        elif sw == "vanilla":
+            manifest = get_json("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+            ventry = next((x for x in manifest.get("versions", []) if x.get("id") == ver), None)
+            if ventry and ventry.get("url"):
+                vdata = get_json(ventry["url"])
+                dl = ((vdata.get("downloads") or {}).get("server") or {}).get("url")
+                if dl:
+                    return dl, sw, ver, "official"
+        elif sw == "spigot":
+            return f"https://download.getbukkit.org/spigot/spigot-{ver}.jar", sw, ver, "stable"
+    except Exception:
+        pass
+    return DEFAULT_JAR_URL, "paper", "1.21.10", "130"
+
+
 class ShardAgent:
     def __init__(self):
         self.lock = threading.Lock()
         self.sync_lock = threading.Lock()
+        self.sync_event = threading.Event()
         self.logs = []
         self.next_seq = 1
         self.last_sent_seq = 0
 
+        self.software = SHARD_SOFTWARE
+        self.version = SHARD_VERSION
+        self.build = SHARD_BUILD
+        self.jar_url = SHARD_JAR_URL
+
         self.state = "creating"
-        self.step = "Initializing container environment..."
+        self.step = "Initializing environment..."
         self.progress = 15
         self.bore_port = 0
         self.bore_address = ""
+        self.relay_ip = ""
         self.mc_proc = None
+        self.mc_pty_fd = None
         self.bore_proc = None
         self.mc_ever_up = False
         self.desired_mc = "running"
@@ -70,12 +163,14 @@ class ShardAgent:
         self.started_at = time.time()
         self.expires_at = self.started_at + (DURATION_MIN * 60)
 
+        self.online_players = set()
         self.oidc_token = ""
         self.oidc_exp = 0
         self.cmd_results = []
         self.files_dirty = True
         self.last_files_sync = 0
         self.last_stats_time = 0
+        self.last_bossbar_sync = 0
         self.stats = {
             "players_online": 0,
             "players_max": 20,
@@ -87,9 +182,28 @@ class ShardAgent:
             "cpu_load": 0.0,
         }
 
+    def print_ascii_banner(self):
+        for line in SHARDS_ASCII:
+            self.log_line(line)
+
     def log_line(self, line, daemon=False):
-        clean = ANSI_RE.sub("", line.rstrip("\r\n"))
-        if not clean:
+        raw = line.rstrip("\r\n")
+        clean = CTRL_ANSI_RE.sub("", raw)
+        clean = ISO_PREFIX_RE.sub("", clean)
+        plain = PLAIN_ANSI_RE.sub("", clean).strip()
+        if not plain:
+            return
+        # Suppress JLine warning and internal bossbar feedback spam
+        if (
+            "Advanced terminal features are not available in this environment" in plain
+            or "Custom bossbar shards:branding" in plain
+            or "No bossbar exists with the ID" in plain
+            or "is already set to that value" in plain
+            or "Nothing changed. That's already the style" in plain
+            or "Nothing changed. That's already the color" in plain
+            or "Nothing changed. That bossbar is already visible" in plain
+            or "No player was found" in plain
+        ):
             return
         clean = BORE_SCRUB_RE.sub(f"{SHARD_NAME}.zealot.bond", clean)
         if daemon:
@@ -102,6 +216,7 @@ class ShardAgent:
             self.next_seq += 1
             if len(self.logs) > 2500:
                 self.logs = self.logs[-2000:]
+        self.sync_event.set()
 
     def get_oidc_token(self):
         now = time.time()
@@ -140,6 +255,72 @@ class ShardAgent:
         if target != root and root not in target.parents:
             raise ValueError("Path escapes server workspace")
         return target
+
+    def enforce_branding_files(self):
+        SERVER_DIR.mkdir(parents=True, exist_ok=True)
+        (SERVER_DIR / "eula.txt").write_text("eula=true\n", encoding="utf-8")
+        props_path = SERVER_DIR / "server.properties"
+        if not props_path.exists():
+            props_path.write_text(
+                f"""#Minecraft server properties
+server-port=25565
+online-mode=true
+max-players=20
+view-distance=8
+simulation-distance=6
+motd={LOCKED_MOTD}
+difficulty=normal
+gamemode=survival
+pvp=true
+spawn-protection=0
+enable-query=false
+enforce-secure-profile=false
+""",
+                encoding="utf-8",
+            )
+            return
+        try:
+            raw = props_path.read_text(encoding="utf-8", errors="replace")
+            lines = raw.splitlines()
+            out = []
+            found_motd = False
+            changed = False
+            for ln in lines:
+                s = ln.strip()
+                if s.startswith("motd="):
+                    found_motd = True
+                    if s != f"motd={LOCKED_MOTD}":
+                        changed = True
+                    out.append(f"motd={LOCKED_MOTD}")
+                else:
+                    out.append(ln)
+            if not found_motd:
+                out.append(f"motd={LOCKED_MOTD}")
+                changed = True
+            if changed:
+                props_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+                self.files_dirty = True
+        except Exception:
+            pass
+
+    def enforce_bossbar(self):
+        if self.state != "running":
+            return
+        proc = self.mc_proc
+        if not proc or proc.poll() is not None:
+            return
+        cmds = [
+            f"bossbar add shards:branding {LOCKED_BOSSBAR_JSON}",
+            f"bossbar set shards:branding name {LOCKED_BOSSBAR_JSON}",
+            "bossbar set shards:branding color blue",
+            "bossbar set shards:branding style progress",
+            "bossbar set shards:branding value 100",
+            "bossbar set shards:branding max 100",
+            "bossbar set shards:branding visible true",
+            "bossbar set shards:branding players @a",
+        ]
+        for c in cmds:
+            self._write_mc_raw(c + "\n")
 
     def build_files_snapshot(self):
         if not SERVER_DIR.exists():
@@ -196,7 +377,7 @@ class ShardAgent:
 
     def collect_stats(self):
         now = time.time()
-        if now - self.last_stats_time < 2.0:
+        if now - self.last_stats_time < 1.5:
             return
         self.last_stats_time = now
         ram_mb = 0
@@ -226,30 +407,16 @@ class ShardAgent:
         except Exception:
             pass
 
-        players_online = 0
-        players_max = 20
-        player_names = []
-        if self.state == "running" and proc and proc.poll() is None:
-            try:
-                info = self.ping_mc_local()
-                if info:
-                    p = info.get("players") or {}
-                    players_online = int(p.get("online") or 0)
-                    players_max = int(p.get("max") or 20)
-                    sample = p.get("sample") or []
-                    player_names = [str(x.get("name")) for x in sample if x.get("name")]
-            except Exception:
-                pass
-
         try:
             load1, _, _ = os.getloadavg()
         except Exception:
             load1 = 0.0
 
+        pnames = sorted(self.online_players)
         self.stats = {
-            "players_online": players_online,
-            "players_max": players_max,
-            "player_names": player_names,
+            "players_online": len(pnames),
+            "players_max": 20,
+            "player_names": pnames,
             "ram_used_mb": ram_mb,
             "ram_total_mb": 16384,
             "disk_used_mb": disk_mb,
@@ -257,51 +424,14 @@ class ShardAgent:
             "cpu_load": round(load1, 2),
         }
 
-    @staticmethod
-    def ping_mc_local():
-        def wv(n):
-            out = b""
-            while True:
-                b = n & 0x7F
-                n >>= 7
-                out += bytes([b | (0x80 if n else 0)])
-                if not n:
-                    return out
-
-        def rv(sock):
-            num = 0
-            sh = 0
-            while True:
-                c = sock.recv(1)
-                if not c:
-                    raise EOFError
-                b = c[0]
-                num |= (b & 0x7F) << sh
-                if not (b & 0x80):
-                    return num
-                sh += 7
-
-        with socket.create_connection(("127.0.0.1", 25565), timeout=1.5) as s:
-            host = b"127.0.0.1"
-            body = b"\x00" + wv(765) + wv(len(host)) + host + struct.pack(">H", 25565) + b"\x01"
-            s.sendall(wv(len(body)) + body)
-            s.sendall(wv(1) + b"\x00")
-            _ = rv(s)
-            pkt_id = rv(s)
-            if pkt_id != 0:
-                return None
-            jlen = rv(s)
-            buf = b""
-            while len(buf) < jlen:
-                chunk = s.recv(jlen - len(buf))
-                if not chunk:
-                    break
-                buf += chunk
-            return json.loads(buf.decode("utf-8", "replace"))
-
     def start_bore_tunnel(self):
         if self.bore_proc and self.bore_proc.poll() is None:
             return
+        try:
+            self.relay_ip = socket.gethostbyname("bore.pub")
+        except Exception:
+            self.relay_ip = "159.223.110.159"
+
         bore_log = BOX_DIR / "bore.log"
         self.bore_proc = subprocess.Popen(
             [str(BORE_BIN), "local", "25565", "--to", "bore.pub", "--port", "0", "--local-host", "127.0.0.1"],
@@ -309,33 +439,51 @@ class ShardAgent:
             stderr=subprocess.STDOUT,
             cwd=str(BOX_DIR),
         )
-        for _ in range(35):
+        for _ in range(40):
             if bore_log.exists():
-                txt = ANSI_RE.sub("", bore_log.read_text(errors="replace"))
+                txt = PLAIN_ANSI_RE.sub("", bore_log.read_text(errors="replace"))
                 m = re.search(r"remote_port=(\d+)", txt)
                 if m:
                     self.bore_port = int(m.group(1))
                     self.bore_address = f"bore.pub:{self.bore_port}"
-                    self.log_line(f"Network route bound to {SHARD_NAME}.zealot.bond", daemon=True)
+                    self.log_line(f"Network route bound -> {SHARD_NAME}.zealot.bond:{self.bore_port}", daemon=True)
                     return
-            time.sleep(0.5)
+            time.sleep(0.3)
+
+    def _write_mc_raw(self, data_str):
+        fd = self.mc_pty_fd
+        if fd is not None:
+            try:
+                os.write(fd, data_str.encode("utf-8"))
+                return True
+            except OSError:
+                pass
+        return False
 
     def start_mc_server(self, initial=False):
         if self.mc_proc and self.mc_proc.poll() is None:
             return
+        self.enforce_branding_files()
         self.desired_mc = "running"
+        self.online_players.clear()
         if initial and not self.mc_ever_up:
             self.state = "creating"
-            self.step = "Starting Minecraft server..."
-            self.progress = 70
+            self.step = f"Starting {self.software.capitalize()} {self.version}..."
+            self.progress = 72
         else:
             self.state = "starting"
-            self.step = "Starting server..."
+            self.step = f"Starting {self.software.capitalize()} {self.version}..."
             self.progress = 80
 
+        self.print_ascii_banner()
         java_bin = find_java_bin()
-        self.log_line("Server marked as starting...", daemon=True)
-        self.log_line("java -Xms2G -Xmx12G -XX:+UseG1GC -jar server.jar nogui", daemon=True)
+        self.log_line(f"Starting {self.software.capitalize()} {self.version} (Build {self.build})...", daemon=True)
+
+        master_fd, slave_fd = pty.openpty()
+        self.mc_pty_fd = master_fd
+        env = os.environ.copy()
+        env["TERM"] = "xterm-256color"
+
         cmd = [
             java_bin,
             "-Xms2G",
@@ -345,48 +493,60 @@ class ShardAgent:
             "-XX:MaxGCPauseMillis=200",
             "-XX:+UnlockExperimentalVMOptions",
             "-XX:+DisableExplicitGC",
+            "-Djava.net.preferIPv4Stack=true",
+            "-Dterminal.jline=false",
+            "-Dterminal.ansi=true",
+            "-Djansi.passthrough=true",
             "-jar",
             str(BOX_DIR / "server.jar"),
             "nogui",
         ]
         self.mc_proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
             cwd=str(SERVER_DIR),
-            text=True,
-            bufsize=1,
+            env=env,
+            close_fds=True,
         )
-        t = threading.Thread(target=self._read_mc_stdout, args=(self.mc_proc,), daemon=True)
+        os.close(slave_fd)
+        t = threading.Thread(target=self._read_mc_pty, args=(self.mc_proc, master_fd), daemon=True)
         t.start()
 
-    def _read_mc_stdout(self, proc):
+    def _read_mc_pty(self, proc, master_fd):
+        buf = b""
         try:
-            for line in proc.stdout:
-                self.log_line(line)
-                if not self.mc_ever_up:
-                    if "Loading libraries" in line or "Downloading" in line:
-                        self.step = "Loading libraries..."
-                        self.progress = 78
-                    elif "Preparing level" in line:
-                        self.step = "Generating world..."
-                        self.progress = 86
-                    elif "Preparing start region" in line:
-                        self.step = "Preparing spawn area..."
-                        self.progress = 94
-                if DONE_RE.search(line):
-                    self.mc_ever_up = True
-                    self.state = "running"
-                    self.step = "Running"
-                    self.progress = 100
-                    self.files_dirty = True
-                    self.log_line(f"Server marked as running ({SHARD_NAME}.zealot.bond)", daemon=True)
+            while True:
+                rlist, _, _ = select.select([master_fd], [], [], 0.25)
+                if master_fd in rlist:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw_line, buf = buf.split(b"\n", 1)
+                        line = raw_line.decode("utf-8", errors="replace")
+                        self._process_mc_line(line)
+                elif proc.poll() is not None:
+                    break
+            if buf:
+                self._process_mc_line(buf.decode("utf-8", errors="replace"))
         except Exception:
             pass
         finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            if self.mc_pty_fd == master_fd:
+                self.mc_pty_fd = None
             rc = proc.wait()
             if self.mc_proc is proc:
+                self.online_players.clear()
                 if self.desired_mc == "stopped":
                     self.state = "stopped"
                     self.step = "Offline"
@@ -399,6 +559,36 @@ class ShardAgent:
                     self.log_line(f"Process exited with code {rc}.", daemon=True)
                 self.files_dirty = True
 
+    def _process_mc_line(self, line):
+        self.log_line(line)
+        plain = PLAIN_ANSI_RE.sub("", line)
+        if not self.mc_ever_up:
+            if "Loading libraries" in plain or "Downloading" in plain:
+                self.step = "Loading libraries..."
+                self.progress = 78
+            elif "Preparing level" in plain:
+                self.step = "Generating world..."
+                self.progress = 86
+            elif "Preparing start region" in plain:
+                self.step = "Preparing spawn area..."
+                self.progress = 94
+        if DONE_RE.search(plain):
+            self.mc_ever_up = True
+            self.state = "running"
+            self.step = "Running"
+            self.progress = 100
+            self.files_dirty = True
+            self.log_line(f"Server marked as running ({SHARD_NAME}.zealot.bond)", daemon=True)
+            threading.Timer(1.0, self.enforce_bossbar).start()
+
+        jm = JOIN_RE.search(plain)
+        if jm:
+            self.online_players.add(jm.group(1))
+            threading.Timer(0.8, self.enforce_bossbar).start()
+        lm = LEAVE_RE.search(plain)
+        if lm:
+            self.online_players.discard(lm.group(1))
+
     def stop_mc_server(self, for_restart=False):
         self.desired_mc = "restarting" if for_restart else "stopped"
         proc = self.mc_proc
@@ -410,16 +600,11 @@ class ShardAgent:
         self.state = "restarting" if for_restart else "stopping"
         self.step = "Restarting..." if for_restart else "Stopping..."
         self.log_line("Sending stop command to server...", daemon=True)
-        try:
-            if proc.stdin:
-                proc.stdin.write("save-all\nstop\n")
-                proc.stdin.flush()
-        except Exception:
-            pass
+        self._write_mc_raw("save-all\nstop\n")
         for _ in range(25):
             if proc.poll() is not None:
                 break
-            time.sleep(1)
+            time.sleep(0.5)
         if proc.poll() is None:
             self.log_line("Terminating unresponsive process...", daemon=True)
             try:
@@ -434,8 +619,47 @@ class ShardAgent:
 
     def restart_mc_server(self):
         self.stop_mc_server(for_restart=True)
-        time.sleep(1)
+        time.sleep(0.8)
         self.start_mc_server(initial=False)
+
+    def switch_version(self, software, version, build, jar_url):
+        sw_url, sw, ver, bnum = resolve_software_jar_url(software, version, build, jar_url)
+        self.log_line(f"Switching server version to {sw.capitalize()} {ver} (build {bnum})...", daemon=True)
+        was_running = self.mc_proc and self.mc_proc.poll() is None
+        if was_running:
+            self.stop_mc_server(for_restart=True)
+        self.state = "starting"
+        self.step = f"Installing {sw.capitalize()} {ver}..."
+        tmp_jar = BOX_DIR / "server.jar.new"
+        try:
+            subprocess.run(["curl", "-fsSL", "-A", "Shards/1.0", "-o", str(tmp_jar), sw_url], check=True)
+            if tmp_jar.exists() and tmp_jar.stat().st_size > 100000:
+                tmp_jar.replace(BOX_DIR / "server.jar")
+                self.software = sw
+                self.version = ver
+                self.build = bnum
+                self.jar_url = sw_url
+                self.log_line(f"Installed {sw.capitalize()} {ver} (#{bnum}). Worlds and configs preserved.", daemon=True)
+            else:
+                raise RuntimeError("Downloaded jar was empty or invalid")
+        except Exception as exc:
+            self.log_line(f"Version switch failed: {exc}", daemon=True)
+        self.start_mc_server(initial=False)
+
+    def install_plugin(self, name, filename, download_url):
+        plugins_dir = SERVER_DIR / "plugins"
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        safe_fname = re.sub(r"[^A-Za-z0-9._-]", "-", filename or "plugin.jar")
+        if not safe_fname.endswith(".jar"):
+            safe_fname += ".jar"
+        target = plugins_dir / safe_fname
+        self.log_line(f"Installing plugin {name} ({safe_fname})...", daemon=True)
+        try:
+            subprocess.run(["curl", "-fsSL", "-L", "-A", "Shards/1.0", "-o", str(target), download_url], check=True)
+            self.files_dirty = True
+            self.log_line(f"Installed plugin {safe_fname} into /home/container/plugins/.", daemon=True)
+        except Exception as exc:
+            self.log_line(f"Failed to install plugin {name}: {exc}", daemon=True)
 
     def send_mc_command(self, command):
         cmd = (command or "").strip()
@@ -443,15 +667,15 @@ class ShardAgent:
             cmd = cmd[1:]
         if not cmd:
             return
+        low = cmd.lower()
+        if low.startswith("bossbar") or low.startswith("minecraft:bossbar"):
+            self.log_line("Branding (MOTD & BossBar) is read-only and cannot be modified.", daemon=True)
+            return
         proc = self.mc_proc
-        if not proc or proc.poll() is not None or not proc.stdin:
+        if not proc or proc.poll() is not None:
             self.log_line("Cannot send command — server is offline.", daemon=True)
             return
-        try:
-            proc.stdin.write(cmd + "\n")
-            proc.stdin.flush()
-        except Exception as exc:
-            self.log_line(f"Command failed: {exc}", daemon=True)
+        self._write_mc_raw(cmd + "\n")
 
     def handle_command(self, cmd_obj):
         cid = cmd_obj.get("id") or ""
@@ -466,6 +690,27 @@ class ShardAgent:
                 threading.Thread(target=self.restart_mc_server, daemon=True).start()
             elif ctype == "mc_command":
                 self.send_mc_command(cmd_obj.get("command") or "")
+            elif ctype == "change_version":
+                threading.Thread(
+                    target=self.switch_version,
+                    args=(
+                        cmd_obj.get("software") or "paper",
+                        cmd_obj.get("version") or "1.21.10",
+                        cmd_obj.get("build") or "latest",
+                        cmd_obj.get("jar_url") or "",
+                    ),
+                    daemon=True,
+                ).start()
+            elif ctype == "plugin_install":
+                threading.Thread(
+                    target=self.install_plugin,
+                    args=(
+                        cmd_obj.get("name") or "Plugin",
+                        cmd_obj.get("filename") or "plugin.jar",
+                        cmd_obj.get("url") or "",
+                    ),
+                    daemon=True,
+                ).start()
             elif ctype == "shard_suspend":
                 self.should_exit = True
                 threading.Thread(target=self.stop_mc_server, daemon=True).start()
@@ -476,6 +721,8 @@ class ShardAgent:
                     target.write_bytes(base64.b64decode(cmd_obj.get("content") or ""))
                 else:
                     target.write_text(cmd_obj.get("content") or "", encoding="utf-8")
+                if target.name == "server.properties":
+                    self.enforce_branding_files()
                 self.files_dirty = True
             elif ctype == "file_read":
                 target = self.resolve_safe_path(cmd_obj.get("path") or "")
@@ -505,12 +752,15 @@ class ShardAgent:
                     shutil.rmtree(target)
                 elif target.exists():
                     target.unlink()
+                if target.name == "server.properties":
+                    self.enforce_branding_files()
                 self.files_dirty = True
         except Exception as exc:
             res["ok"] = False
             res["error"] = str(exc)
         with self.lock:
             self.cmd_results.append(res)
+        self.sync_event.set()
 
     def sync_once(self):
         if not SHARD_OWNER or not API_BASE:
@@ -526,7 +776,7 @@ class ShardAgent:
 
             now = time.time()
             files_snap = None
-            if self.files_dirty or (now - self.last_files_sync > 12):
+            if self.files_dirty or (now - self.last_files_sync > 10):
                 files_snap = self.build_files_snapshot()
                 self.files_dirty = False
                 self.last_files_sync = now
@@ -536,11 +786,15 @@ class ShardAgent:
                 "shard_id": SHARD_ID,
                 "name": SHARD_NAME,
                 "run_id": RUN_ID,
+                "software": self.software,
+                "version": self.version,
+                "build": self.build,
                 "state": self.state,
                 "step": self.step,
                 "progress": self.progress,
                 "bore_port": self.bore_port,
                 "bore_address": self.bore_address,
+                "relay_ip": self.relay_ip,
                 "started_at": int(self.started_at * 1000),
                 "expires_at": int(self.expires_at * 1000),
                 "stats": self.stats,
@@ -565,7 +819,7 @@ class ShardAgent:
                 },
             )
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=8) as resp:
                     resp_data = json.load(resp)
                     if new_logs:
                         self.last_sent_seq = new_logs[-1]["seq"]
@@ -582,47 +836,36 @@ class ShardAgent:
 
     def _sync_worker(self):
         while not self.should_exit:
-            had_logs = self.sync_once()
-            time.sleep(0.6 if had_logs else 1.1)
+            self.sync_event.wait(timeout=0.35)
+            self.sync_event.clear()
+            self.sync_once()
+            time.sleep(0.12)
 
     def setup_workspace(self):
         BOX_DIR.mkdir(parents=True, exist_ok=True)
         SERVER_DIR.mkdir(parents=True, exist_ok=True)
         (SERVER_DIR / "plugins").mkdir(parents=True, exist_ok=True)
 
-        self.step = "Pulling Paper 1.21.10 image..."
+        sw_url, sw, ver, bnum = resolve_software_jar_url(self.software, self.version, self.build, self.jar_url)
+        self.software = sw
+        self.version = ver
+        self.build = bnum
+        self.jar_url = sw_url
+
+        self.step = f"Pulling {sw.capitalize()} {ver} image..."
         self.progress = 30
-        self.log_line(f"Pulling Paper 1.21.10 environment for {SHARD_NAME}.zealot.bond...", daemon=True)
+        self.log_line(f"Pulling {sw.capitalize()} {ver} (#{bnum}) for {SHARD_NAME}.zealot.bond...", daemon=True)
 
         jar_path = BOX_DIR / "server.jar"
         if not jar_path.exists():
-            subprocess.run(["curl", "-fsSL", "-o", str(jar_path), JAR_URL], check=True)
+            subprocess.run(["curl", "-fsSL", "-L", "-A", "Shards/1.0", "-o", str(jar_path), sw_url], check=True)
         if not BORE_BIN.exists():
             tar_path = BOX_DIR / "bore.tar.gz"
             subprocess.run(["curl", "-fsSL", "-o", str(tar_path), BORE_URL], check=True)
             subprocess.run(["tar", "xzf", str(tar_path), "-C", str(BOX_DIR)], check=True)
             BORE_BIN.chmod(0o755)
 
-        (SERVER_DIR / "eula.txt").write_text("eula=true\n", encoding="utf-8")
-        props_path = SERVER_DIR / "server.properties"
-        if not props_path.exists():
-            props_path.write_text(
-                f"""#Minecraft server properties
-server-port=25565
-online-mode=true
-max-players=20
-view-distance=8
-simulation-distance=6
-motd=\\u00a7b\\u00a7lShards \\u00a78\\u00bb \\u00a7f{SHARD_NAME}.zealot.bond
-difficulty=normal
-gamemode=survival
-pvp=true
-spawn-protection=0
-enable-query=false
-enforce-secure-profile=false
-""",
-                encoding="utf-8",
-            )
+        self.enforce_branding_files()
         self.files_dirty = True
 
         self.step = f"Binding {SHARD_NAME}.zealot.bond..."
@@ -639,6 +882,11 @@ enforce-secure-profile=false
         while not self.should_exit and time.time() < self.expires_at:
             if self.bore_proc and self.bore_proc.poll() is not None:
                 self.start_bore_tunnel()
+            self.enforce_branding_files()
+            now = time.time()
+            if self.state == "running" and now - self.last_bossbar_sync > 12:
+                self.last_bossbar_sync = now
+                self.enforce_bossbar()
             time.sleep(1.5)
 
         self.stop_mc_server()
