@@ -79,7 +79,13 @@ jobs:
             25
 
       - name: Mask token
-        run: echo "::add-mask::${{ inputs.agent_token }}"
+        # Read from the env so the raw value is never interpolated into the
+        # step command (which GitHub echoes into public logs).
+        env:
+          MASK_ME: ${{ inputs.agent_token }}
+        run: |
+          printf '::add-mask::%s\n' "$MASK_ME"
+          unset MASK_ME
 
       - name: Run Shard Agent
         env:
