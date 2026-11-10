@@ -7,6 +7,11 @@ DURATION="${1:-8}"
 # Never exceed the workflow's 300-minute cap; leave headroom for setup/cleanup.
 if [ "$DURATION" -gt 280 ]; then DURATION=280; fi
 
+# Shard name comes from the workflow inputs (validated by the panel, sanitized here too).
+RAW_NAME="${2:-glasslane}"
+NAME="$(printf '%s' "$RAW_NAME" | tr -cd 'a-z0-9-' | cut -c1-24)"
+NAME="${NAME:-glasslane}"
+
 BOX="$(pwd)/.devlane"
 JAR_URL="https://fill-data.papermc.io/v1/objects/158703f75a26f842ea656b3dc6d75bf3d1ec176b97a2c36384d0b80b3871af53/paper-1.21.10-130.jar"
 BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
@@ -15,6 +20,7 @@ echo "::group::1) create workspace"
 mkdir -p "$BOX"
 cd "$BOX"
 echo "  workspace: $BOX"
+echo "  shard name: $NAME"
 echo "::endgroup::"
 
 echo "::group::2) fetch Paper + bore"
@@ -29,14 +35,14 @@ echo "::endgroup::"
 
 echo "::group::3) accept EULA, configure"
 printf 'eula=true\n' > eula.txt
-cat > server.properties <<'PROPS'
+cat > server.properties <<PROPS
 # Minimal dev/test config
 server-port=25565
 online-mode=true
 max-players=10
 view-distance=6
 simulation-distance=4
-motd=Glasslane dev lane
+motd=shard-${NAME}
 level-type=flat
 spawn-protection=0
 enable-query=false
@@ -47,7 +53,6 @@ echo "::group::4) start Minecraft server"
 nohup java -Xms512M -Xmx4G -jar server.jar nogui > "$BOX/server.log" 2>&1 &
 MC_PID=$!
 echo "  MC pid: $MC_PID"
-# Wait for the local port to listen (up to 120s)
 for i in $(seq 1 60); do
   if (echo > /dev/tcp/127.0.0.1/25565) >/dev/null 2>&1; then echo "  local 25565 is up (t=${i}x2s)"; break; fi
   if ! kill -0 "$MC_PID" 2>/dev/null; then echo "::error::MC process died"; tail -40 "$BOX/server.log"; exit 1; fi
@@ -56,13 +61,10 @@ done
 echo "::endgroup::"
 
 echo "::group::5) start bore raw-TCP relay"
-# Port 0 lets the relay assign a free public port. We capture the assigned port
-# from the log; the real system will report this back to a Worker that creates DNS.
 ./bore local 25565 --to bore.pub --port 0 --local-host 127.0.0.1 > "$BOX/bore.log" 2>&1 &
 BORE_PID=$!
 PUBLIC_PORT=""
 for i in $(seq 1 30); do
-  # bore logs with ANSI color codes, so strip them before extracting the port.
   PUBLIC_PORT=$(sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$BOX/bore.log" 2>/dev/null | grep -oE 'remote_port=[0-9]+' | head -1 | cut -d= -f2 || true)
   [ -n "$PUBLIC_PORT" ] && break
   sleep 1
