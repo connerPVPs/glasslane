@@ -25,7 +25,7 @@ on:
       version:
         description: "Minecraft version"
         required: false
-        default: "1.21.10"
+        default: "1.21.11"
         type: string
       build:
         description: "Software build"
@@ -41,6 +41,11 @@ on:
         description: "Shards control-plane base URL"
         required: false
         default: "https://shards.zealot.bond"
+        type: string
+      agent_token:
+        description: "Short-lived per-shard sync token"
+        required: false
+        default: ""
         type: string
       duration_minutes:
         description: "Duration minutes (max 290)"
@@ -65,6 +70,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Mask token
+        run: echo "::add-mask::${{ inputs.agent_token }}"
+
       - name: Run Shard Agent
         env:
           SHARD_OWNER: ${{ inputs.owner }}
@@ -75,6 +83,7 @@ jobs:
           SHARD_BUILD: ${{ inputs.build }}
           SHARD_JAR_URL: ${{ inputs.jar_url }}
           SHARDS_API_URL: ${{ inputs.api_url }}
+          AGENT_TOKEN: ${{ inputs.agent_token }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/shard-agent.py

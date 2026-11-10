@@ -25,18 +25,20 @@ SHARD_OWNER = (os.environ.get("SHARD_OWNER") or "").strip()
 SHARD_NAME = re.sub(r"[^a-z0-9-]", "", (os.environ.get("SHARD_NAME") or "shard").lower())[:24] or "shard"
 SHARD_ID = (os.environ.get("SHARD_ID") or "").strip()
 SHARD_SOFTWARE = (os.environ.get("SHARD_SOFTWARE") or "paper").strip().lower()
-SHARD_VERSION = (os.environ.get("SHARD_VERSION") or "1.21.10").strip()
+SHARD_VERSION = (os.environ.get("SHARD_VERSION") or "1.21.11").strip()
 SHARD_BUILD = (os.environ.get("SHARD_BUILD") or "latest").strip()
 SHARD_JAR_URL = (os.environ.get("SHARD_JAR_URL") or "").strip()
 API_BASE = (os.environ.get("SHARDS_API_URL") or "https://shards.zealot.bond").rstrip("/")
 RUN_ID = (os.environ.get("GITHUB_RUN_ID") or "").strip()
+AGENT_TOKEN = (os.environ.get("AGENT_TOKEN") or "").strip()
+FILL_UA = "Shards/2.1.0 (https://shards.zealot.bond)"
 
 ROOT_DIR = Path.cwd()
 BOX_DIR = ROOT_DIR / ".devlane"
 SERVER_DIR = BOX_DIR / "server"
 BORE_BIN = BOX_DIR / "bore"
 
-DEFAULT_JAR_URL = "https://fill-data.papermc.io/v1/objects/158703f75a26f842ea656b3dc6d75bf3d1ec176b97a2c36384d0b80b3871af53/paper-1.21.10-130.jar"
+DEFAULT_JAR_URL = "https://fill-data.papermc.io/v1/objects/5ffef465eeeb5f2a3c23a24419d97c51afd7dbb4923ff42df9a3f58bba1ccfba/paper-1.21.11-132.jar"
 BORE_URL = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
 
 LOCKED_MOTD = r"\u00a7bHosted on shards.zealot.bond"
@@ -75,8 +77,8 @@ def resolve_software_jar_url(software, version, build="latest", explicit_url="")
     if explicit_url and explicit_url.startswith("https://"):
         return explicit_url, software, version, build
     sw = (software or "paper").lower()
-    ver = (version or "1.21.10").strip()
-    headers = {"User-Agent": "Shards/1.0 (https://shards.zealot.bond)"}
+    ver = (version or "1.21.11").strip()
+    headers = {"User-Agent": FILL_UA, "Accept": "application/json"}
 
     def get_json(url):
         req = urllib.request.Request(url, headers=headers)
@@ -84,15 +86,21 @@ def resolve_software_jar_url(software, version, build="latest", explicit_url="")
             return json.load(r)
 
     try:
-        if sw in ("paper", "folia", "velocity"):
-            proj = sw
-            d = get_json(f"https://api.papermc.io/v2/projects/{proj}/versions/{ver}/builds")
-            builds = d.get("builds") or []
+        if sw in ("paper", "folia", "velocity", "pufferfish"):
+            # PaperMC's v2 API was sunset in 2026. Fill v3 embeds the direct
+            # object URL in each build, so no URL construction is needed.
+            proj = "paper" if sw == "pufferfish" else sw
+            d = get_json(f"https://fill.papermc.io/v3/projects/{proj}/versions/{ver}/builds")
+            builds = d if isinstance(d, list) else (d.get("builds") or [])
             if builds:
-                b = builds[-1] if build in ("", "latest") else next((x for x in builds if str(x.get("build")) == str(build)), builds[-1])
-                bnum = b.get("build")
-                fname = ((b.get("downloads") or {}).get("application") or {}).get("name") or f"{proj}-{ver}-{bnum}.jar"
-                return f"https://api.papermc.io/v2/projects/{proj}/versions/{ver}/builds/{bnum}/downloads/{fname}", sw, ver, str(bnum)
+                b = builds[0] if build in ("", "latest") else next((x for x in builds if str(x.get("id") or x.get("build")) == str(build)), builds[0])
+                bnum = b.get("id") or b.get("build")
+                dl = (b.get("downloads") or {}).get("server:default") or (b.get("downloads") or {}).get("application") or {}
+                url = dl.get("url")
+                if url:
+                    return url, sw, ver, str(bnum)
+                fname = dl.get("name") or f"{proj}-{ver}-{bnum}.jar"
+                return f"https://fill.papermc.io/v3/projects/{proj}/versions/{ver}/builds/{bnum}/downloads/{fname}", sw, ver, str(bnum)
         elif sw == "purpur":
             d = get_json(f"https://api.purpurmc.org/v2/purpur/{ver}")
             builds = (d.get("builds") or {}).get("all") or []
@@ -109,16 +117,11 @@ def resolve_software_jar_url(software, version, build="latest", explicit_url="")
                 bnum = b.get("build")
                 fname = ((b.get("downloads") or {}).get("primary") or {}).get("name") or f"leaf-{ver}-{bnum}.jar"
                 return f"https://api.leafmc.one/v2/projects/leaf/versions/{ver}/builds/{bnum}/downloads/{fname}", sw, ver, str(bnum)
-        elif sw == "pufferfish":
-            major = "1.20" if ver.startswith("1.20") else ("1.19" if ver.startswith("1.19") else "1.21")
-            d = get_json(f"https://ci.pufferfish.host/job/Pufferfish-{major}/lastSuccessfulBuild/api/json")
-            arts = d.get("artifacts") or []
-            if arts:
-                rel = arts[0].get("relativePath")
-                bnum = d.get("number") or "latest"
-                return f"https://ci.pufferfish.host/job/Pufferfish-{major}/lastSuccessfulBuild/artifact/{rel}", sw, ver, str(bnum)
         elif sw == "fabric":
-            return f"https://meta.fabricmc.net/v2/versions/loader/{ver}/0.16.9/1.0.1/server/jar", sw, ver, "0.16.9"
+            d = get_json("https://meta.fabricmc.net/v2/versions/loader")
+            stable = [x for x in (d or []) if x.get("stable")]
+            loader = (stable[0].get("version") if stable else "0.16.9")
+            return f"https://meta.fabricmc.net/v2/versions/loader/{ver}/{loader}/1.0.1/server/jar", sw, ver, loader
         elif sw == "vanilla":
             manifest = get_json("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
             ventry = next((x for x in manifest.get("versions", []) if x.get("id") == ver), None)
@@ -131,7 +134,7 @@ def resolve_software_jar_url(software, version, build="latest", explicit_url="")
             return f"https://download.getbukkit.org/spigot/spigot-{ver}.jar", sw, ver, "stable"
     except Exception:
         pass
-    return DEFAULT_JAR_URL, "paper", "1.21.10", "130"
+    return DEFAULT_JAR_URL, "paper", "1.21.11", "latest"
 
 
 class ShardAgent:
@@ -219,13 +222,18 @@ class ShardAgent:
         self.sync_event.set()
 
     def get_oidc_token(self):
+        # Prefer the per-shard HMAC token minted by the control plane. It is
+        # host-agnostic and works on the migrated VPS too; OIDC is only a
+        # transitional fallback for GitHub-hosted runners.
+        if AGENT_TOKEN:
+            return AGENT_TOKEN
         now = time.time()
         if self.oidc_token and now < self.oidc_exp - 60:
             return self.oidc_token
         req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
         req_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         if not req_url or not req_tok:
-            return os.environ.get("AGENT_TEST_TOKEN") or ""
+            return ""
         sep = "&" if "?" in req_url else "?"
         url = f"{req_url}{sep}audience=shards"
         req = urllib.request.Request(
