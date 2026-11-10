@@ -5,11 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       owner:
-        description: "Shards owner (Discord user id)"
+        description: "Shards owner"
         required: true
         type: string
       name:
-        description: "Shard subdomain prefix (<name>.zealot.bond)"
+        description: "Shard subdomain prefix"
         required: true
         type: string
       shard_id:
@@ -23,7 +23,7 @@ on:
         default: "https://shards.zealot.bond"
         type: string
       duration_minutes:
-        description: "How long to keep the shard alive (max 290)"
+        description: "Duration minutes (max 290)"
         required: false
         default: "290"
         type: string
@@ -44,12 +44,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
 
       - name: Run Shard Agent
         env:
