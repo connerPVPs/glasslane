@@ -63,11 +63,30 @@ SHARDS_ASCII = [
 ]
 
 
-def find_java_bin():
-    jh = os.environ.get("JAVA_HOME_21_X64") or os.environ.get("JAVA_HOME") or ""
-    if jh and Path(jh, "bin", "java").exists():
-        return str(Path(jh, "bin", "java"))
-    for candidate in sorted(glob.glob("/usr/lib/jvm/*21*/bin/java"), reverse=True):
+def version_major(ver):
+    """Return the leading numeric component, e.g. '26.3' -> 26, '1.21.11' -> 21."""
+    m = re.match(r"^(\d+)\.(\d+)", str(ver or ""))
+    if not m:
+        return 0
+    return int(m.group(1)) if int(m.group(1)) > 1 else int(m.group(2))
+
+
+def find_java_bin(version):
+    """Minecraft 26.1+ requires Java 25; 1.21+ requires 21; older uses 17/21."""
+    major = version_major(version)
+    need = 25 if major >= 26 else 21
+    # Prefer the highest matching JDK, then fall back to any installed JDK.
+    for jdk in (25, 21, 17):
+        if jdk < need:
+            continue
+        for env_key in (f"JAVA_HOME_{jdk}_X64", f"JAVA_HOME_{jdk}"):
+            jh = os.environ.get(env_key)
+            if jh and Path(jh, "bin", "java").exists():
+                return str(Path(jh, "bin", "java"))
+        for candidate in sorted(glob.glob(f"/usr/lib/jvm/*{jdk}*/bin/java"), reverse=True):
+            if os.path.exists(candidate):
+                return candidate
+    for candidate in sorted(glob.glob("/usr/lib/jvm/*/bin/java"), reverse=True):
         if os.path.exists(candidate):
             return candidate
     return shutil.which("java") or "java"
@@ -484,7 +503,7 @@ enforce-secure-profile=false
             self.progress = 80
 
         self.print_ascii_banner()
-        java_bin = find_java_bin()
+        java_bin = find_java_bin(self.version)
         self.log_line(f"Starting {self.software.capitalize()} {self.version} (Build {self.build})...", daemon=True)
 
         master_fd, slave_fd = pty.openpty()
