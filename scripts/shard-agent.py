@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shards Runner Agent — PTY ANSI color console, locked MOTD & BossBar branding,
+"""Shards Runner Agent — PTY ANSI color console, locked MOTD branding,
 safe version switcher, plugin installer, and sub-second state sync.
 """
 import base64
@@ -41,7 +41,6 @@ DEFAULT_JAR_URL = "https://fill-data.papermc.io/v1/objects/5ffef465eeeb5f2a3c23a
 BORE_URL = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
 
 LOCKED_MOTD = r"\u00a7bHosted on shards.zealot.bond"
-LOCKED_BOSSBAR_JSON = '{"text":"Hosted on shards.zealot.bond","color":"aqua","bold":true}'
 
 # Keep SGR color codes (\x1b[...m), strip non-color terminal control sequences
 CTRL_ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[A-LN-Z\\^_`a-ln-z{|}~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][A-Za-z0-9]|[=>])")
@@ -190,11 +189,12 @@ class ShardAgent:
         # Per-shard HMAC token returned by the first OIDC-authenticated sync.
         # Never passed through workflow inputs on a public repo.
         self.agent_token = ""
+        self.last_state_sync = 0
         self.cmd_results = []
         self.files_dirty = True
         self.last_files_sync = 0
         self.last_stats_time = 0
-        self.last_bossbar_sync = 0
+
         self.stats = {
             "players_online": 0,
             "players_max": 20,
@@ -217,15 +217,9 @@ class ShardAgent:
         plain = PLAIN_ANSI_RE.sub("", clean).strip()
         if not plain:
             return
-        # Suppress JLine warning and internal bossbar feedback spam
+        # Suppress JLine warning and noisy internal feedback
         if (
             "Advanced terminal features are not available in this environment" in plain
-            or "Custom bossbar shards:branding" in plain
-            or "No bossbar exists with the ID" in plain
-            or "is already set to that value" in plain
-            or "Nothing changed. That's already the style" in plain
-            or "Nothing changed. That's already the color" in plain
-            or "Nothing changed. That bossbar is already visible" in plain
             or "No player was found" in plain
         ):
             return
@@ -331,25 +325,6 @@ enforce-secure-profile=false
                 self.files_dirty = True
         except Exception:
             pass
-
-    def enforce_bossbar(self):
-        if self.state != "running":
-            return
-        proc = self.mc_proc
-        if not proc or proc.poll() is not None:
-            return
-        cmds = [
-            f"bossbar add shards:branding {LOCKED_BOSSBAR_JSON}",
-            f"bossbar set shards:branding name {LOCKED_BOSSBAR_JSON}",
-            "bossbar set shards:branding color blue",
-            "bossbar set shards:branding style progress",
-            "bossbar set shards:branding value 100",
-            "bossbar set shards:branding max 100",
-            "bossbar set shards:branding visible true",
-            "bossbar set shards:branding players @a",
-        ]
-        for c in cmds:
-            self._write_mc_raw(c + "\n")
 
     def build_files_snapshot(self):
         if not SERVER_DIR.exists():
@@ -498,11 +473,11 @@ enforce-secure-profile=false
         if initial and not self.mc_ever_up:
             self.state = "creating"
             self.step = f"Starting {self.software.capitalize()} {self.version}..."
-            self.progress = 72
+            self.progress = 60
         else:
             self.state = "starting"
             self.step = f"Starting {self.software.capitalize()} {self.version}..."
-            self.progress = 80
+            self.progress = max(self.progress, 85)
 
         self.print_ascii_banner()
         java_bin = find_java_bin(self.version)
@@ -592,15 +567,22 @@ enforce-secure-profile=false
         self.log_line(line)
         plain = PLAIN_ANSI_RE.sub("", line)
         if not self.mc_ever_up:
-            if "Loading libraries" in plain or "Downloading" in plain:
+            # Advance progress on real boot signals; keep it monotonic and cap
+            # at 99 until the server actually reports "Done".
+            if "Loading libraries" in plain or "Downloading" in plain or "Applying patches" in plain:
                 self.step = "Loading libraries..."
-                self.progress = 78
-            elif "Preparing level" in plain:
+                self.progress = max(self.progress, 75)
+            elif "Starting org.bukkit" in plain or "Starting net.minecraft" in plain or "Loading properties" in plain:
+                self.step = "Starting server..."
+                self.progress = max(self.progress, 82)
+            elif "Preparing level" in plain or "Preparing spawn" in plain:
                 self.step = "Generating world..."
-                self.progress = 86
-            elif "Preparing start region" in plain:
+                self.progress = max(self.progress, 90)
+            elif "Done preparing level" in plain or "Preparing start region" in plain:
                 self.step = "Preparing spawn area..."
-                self.progress = 94
+                self.progress = max(self.progress, 96)
+            else:
+                self.progress = max(self.progress, min(99, self.progress + 1))
         if DONE_RE.search(plain):
             self.mc_ever_up = True
             self.state = "running"
@@ -608,12 +590,10 @@ enforce-secure-profile=false
             self.progress = 100
             self.files_dirty = True
             self.log_line(f"Server marked as running ({SHARD_NAME}.zealot.bond)", daemon=True)
-            threading.Timer(1.0, self.enforce_bossbar).start()
 
         jm = JOIN_RE.search(plain)
         if jm:
             self.online_players.add(jm.group(1))
-            threading.Timer(0.8, self.enforce_bossbar).start()
         lm = LEAVE_RE.search(plain)
         if lm:
             self.online_players.discard(lm.group(1))
@@ -695,10 +675,6 @@ enforce-secure-profile=false
         if cmd.startswith("/"):
             cmd = cmd[1:]
         if not cmd:
-            return
-        low = cmd.lower()
-        if low.startswith("bossbar") or low.startswith("minecraft:bossbar"):
-            self.log_line("Branding (MOTD & BossBar) is read-only and cannot be modified.", daemon=True)
             return
         proc = self.mc_proc
         if not proc or proc.poll() is not None:
@@ -805,7 +781,7 @@ enforce-secure-profile=false
 
             now = time.time()
             files_snap = None
-            if self.files_dirty or (now - self.last_files_sync > 10):
+            if self.files_dirty or (now - self.last_files_sync > 30):
                 files_snap = self.build_files_snapshot()
                 self.files_dirty = False
                 self.last_files_sync = now
@@ -868,11 +844,15 @@ enforce-secure-profile=false
             self.sync_lock.release()
 
     def _sync_worker(self):
+        # Log lines set sync_event for near-immediate delivery. When idle, only
+        # sync every few seconds instead of hammering the control plane and
+        # rebuilding the file snapshot — that polling was burning idle CPU.
         while not self.should_exit:
-            self.sync_event.wait(timeout=0.35)
+            triggered = self.sync_event.wait(timeout=3.0)
             self.sync_event.clear()
             self.sync_once()
-            time.sleep(0.12)
+            if not triggered:
+                time.sleep(0.2)
 
     def setup_workspace(self):
         BOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -912,15 +892,16 @@ enforce-secure-profile=false
         self.setup_workspace()
         self.start_mc_server(initial=True)
 
+        last_motd_check = 0
         while not self.should_exit and time.time() < self.expires_at:
             if self.bore_proc and self.bore_proc.poll() is not None:
                 self.start_bore_tunnel()
-            self.enforce_branding_files()
             now = time.time()
-            if self.state == "running" and now - self.last_bossbar_sync > 12:
-                self.last_bossbar_sync = now
-                self.enforce_bossbar()
-            time.sleep(1.5)
+            # MOTD only needs re-enforcing occasionally, not every loop tick.
+            if now - last_motd_check > 30:
+                last_motd_check = now
+                self.enforce_branding_files()
+            time.sleep(3.0)
 
         self.stop_mc_server()
         self.state = "expired"
