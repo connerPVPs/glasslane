@@ -42,11 +42,6 @@ on:
         required: false
         default: "https://shards.zealot.bond"
         type: string
-      agent_token:
-        description: "Short-lived per-shard sync token"
-        required: false
-        default: ""
-        type: string
       duration_minutes:
         description: "Duration minutes (max 290)"
         required: false
@@ -78,15 +73,6 @@ jobs:
             21
             25
 
-      - name: Mask token
-        # Read from the env so the raw value is never interpolated into the
-        # step command (which GitHub echoes into public logs).
-        env:
-          MASK_ME: ${{ inputs.agent_token }}
-        run: |
-          printf '::add-mask::%s\n' "$MASK_ME"
-          unset MASK_ME
-
       - name: Run Shard Agent
         env:
           SHARD_OWNER: ${{ inputs.owner }}
@@ -97,7 +83,6 @@ jobs:
           SHARD_BUILD: ${{ inputs.build }}
           SHARD_JAR_URL: ${{ inputs.jar_url }}
           SHARDS_API_URL: ${{ inputs.api_url }}
-          AGENT_TOKEN: ${{ inputs.agent_token }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/shard-agent.py

@@ -30,7 +30,6 @@ SHARD_BUILD = (os.environ.get("SHARD_BUILD") or "latest").strip()
 SHARD_JAR_URL = (os.environ.get("SHARD_JAR_URL") or "").strip()
 API_BASE = (os.environ.get("SHARDS_API_URL") or "https://shards.zealot.bond").rstrip("/")
 RUN_ID = (os.environ.get("GITHUB_RUN_ID") or "").strip()
-AGENT_TOKEN = (os.environ.get("AGENT_TOKEN") or "").strip()
 FILL_UA = "Shards/2.1.0 (https://shards.zealot.bond)"
 
 ROOT_DIR = Path.cwd()
@@ -188,6 +187,9 @@ class ShardAgent:
         self.online_players = set()
         self.oidc_token = ""
         self.oidc_exp = 0
+        # Per-shard HMAC token returned by the first OIDC-authenticated sync.
+        # Never passed through workflow inputs on a public repo.
+        self.agent_token = ""
         self.cmd_results = []
         self.files_dirty = True
         self.last_files_sync = 0
@@ -241,11 +243,11 @@ class ShardAgent:
         self.sync_event.set()
 
     def get_oidc_token(self):
-        # Prefer the per-shard HMAC token minted by the control plane. It is
-        # host-agnostic and works on the migrated VPS too; OIDC is only a
-        # transitional fallback for GitHub-hosted runners.
-        if AGENT_TOKEN:
-            return AGENT_TOKEN
+        # Prefer the per-shard HMAC token returned by the control plane. It is
+        # host-agnostic and works on the migrated VPS too; OIDC is only used
+        # for the very first sync (bootstrap) on GitHub-hosted runners.
+        if self.agent_token:
+            return self.agent_token
         now = time.time()
         if self.oidc_token and now < self.oidc_exp - 60:
             return self.oidc_token
@@ -848,6 +850,10 @@ enforce-secure-profile=false
             try:
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     resp_data = json.load(resp)
+                    tok = resp_data.get("agent_token") or ""
+                    if tok:
+                        self.agent_token = tok
+                        self.oidc_token = ""
                     if new_logs:
                         self.last_sent_seq = new_logs[-1]["seq"]
                     if resp_data.get("suspend"):
