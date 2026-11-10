@@ -17,6 +17,26 @@ on:
         required: false
         default: ""
         type: string
+      software:
+        description: "Server software (paper, leaf, purpur, pufferfish, folia, vanilla, fabric, spigot, velocity)"
+        required: false
+        default: "paper"
+        type: string
+      version:
+        description: "Minecraft version"
+        required: false
+        default: "1.21.10"
+        type: string
+      build:
+        description: "Software build"
+        required: false
+        default: "latest"
+        type: string
+      jar_url:
+        description: "Optional explicit jar URL"
+        required: false
+        default: ""
+        type: string
       api_url:
         description: "Shards control-plane base URL"
         required: false
@@ -50,6 +70,10 @@ jobs:
           SHARD_OWNER: ${{ inputs.owner }}
           SHARD_NAME: ${{ inputs.name }}
           SHARD_ID: ${{ inputs.shard_id }}
+          SHARD_SOFTWARE: ${{ inputs.software }}
+          SHARD_VERSION: ${{ inputs.version }}
+          SHARD_BUILD: ${{ inputs.build }}
+          SHARD_JAR_URL: ${{ inputs.jar_url }}
           SHARDS_API_URL: ${{ inputs.api_url }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
           GITHUB_RUN_ID: ${{ github.run_id }}
